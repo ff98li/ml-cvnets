@@ -11,6 +11,9 @@ from typing import Any, Dict, List, Optional, Union
 from utils import logger
 from utils.ddp_utils import is_start_rank_node
 
+from ..layers.conv_layer import Conv2d
+from ..layers.linear_layer import LinearLayer
+from torch.nn import init
 
 def clean_strip(
     obj: Union[str, List[str]], sep: Optional[str] = ",", strip: bool = True
@@ -100,12 +103,64 @@ def load_pretrained_model(
         if is_master_node:
             logger.log("Pretrained weights are loaded from {}".format(wt_loc))
     except Exception as e:
-        if is_master_node:
-            logger.error(
-                "Unable to load pretrained weights from {}. Error: {}".format(wt_loc, e)
-            )
+        try:
+            # Try loading the state dict with size check
+            load_state_dict_with_size_check(model, wts)
+            if is_master_node:
+                logger.log("Pretrained weights are loaded from {}".format(wt_loc))
+        except Exception as e:
+            if is_master_node:
+                logger.error(
+                    "Unable to load pretrained weights from {}. Error: {}".format(wt_loc, e)
+                )
 
     return model
+
+
+def find_and_replace_layer(model, layer_name, new_layer):
+    """
+    Helper function to replace nested layers
+    """
+    logger.log(f'Replacing layer: {layer_name}')
+    names = layer_name.split(".")
+    if len(names) == 1:
+        setattr(model, names[0], new_layer)
+    elif len(names) == 2:
+        layer = getattr(model, names[0])
+        setattr(layer, names[1], new_layer)
+    else:
+        find_and_replace_layer(getattr(model, names[0]), ".".join(names[1:]), new_layer)
+
+
+def load_state_dict_with_size_check(model, state_dict):
+    """
+    Load pretrained weights for matched size layers only.
+    """
+    model_dict = model.state_dict()
+    for name, param in state_dict.items():
+        # size of the layer's weights doesn't match the size of the corresponding weights in the state_dict
+        if name in model_dict and param.size() != model_dict[name].size():
+            # check if it's a conv layer
+            if 'conv' in name and 'weight' in name:
+                # create a new Conv2d layer with the desired size
+                new_layer = Conv2d(param.size()[1], param.size()[0], kernel_size=(param.size()[2], param.size()[3]), bias=True)
+
+                # replace the mismatched layer with the new layer
+                find_and_replace_layer(model, '.'.join(name.split('.')[:-1]), new_layer)
+
+            elif 'conv' in name and 'bias' in name:
+                weight_name = name.replace('bias', 'weight')
+                if weight_name in model_dict:
+                    # Use the properties of the corresponding weight layer to create a new Conv2d layer
+                    weight_size = model_dict[weight_name].size()
+                    new_layer = Conv2d(weight_size[1], param.size()[0], kernel_size=(weight_size[2], weight_size[3]), bias=True)
+                    init.kaiming_normal_(new_layer.weight, mode='fan_out', nonlinearity='relu')
+
+                    # Replace the mismatched layer with the new layer
+                    find_and_replace_layer(model, '.'.join(name.split('.')[:-1]), new_layer)
+
+    # Load the state dict
+    model.load_state_dict(state_dict)
 
 
 def parameter_list(
